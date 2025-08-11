@@ -10,6 +10,10 @@ Includes:
   (A) Detailed-balance sanity check on a tiny discrete space.
   (B) Mario smoke test with a fixed, hand-crafted π over actions.
 """
+from gym_super_mario_bros.smb_env import SuperMarioBrosEnv
+from nes_py.wrappers import JoypadSpace
+from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
+
 import unittest
 import math
 import numpy as np
@@ -77,33 +81,25 @@ class TestExactMH_DetailedBalance(unittest.TestCase):
         # Expect close to true p (loose tolerance to keep test robust)
         np.testing.assert_allclose(est, p / p.sum(), atol=0.02, rtol=0.05)
 
-# ---- (B) Mario smoke test with fixed π ---------------------------------------
+
 class TestExactMH_Mario(unittest.TestCase):
     def test_runs_with_fixed_target(self):
-        import gym_super_mario_bros
-        from nes_py.wrappers import JoypadSpace
-        from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
-
-        # Build env
-        env = gym_super_mario_bros.make('SuperMarioBros-v0')
+        env = SuperMarioBrosEnv()
         env = JoypadSpace(env, COMPLEX_MOVEMENT)
 
         # --- helpers to be API-agnostic -----------------------------------
         def api_reset(e):
             r = e.reset()
-            # v0.26+: (obs, info), old gym: obs
             if isinstance(r, tuple) and len(r) == 2:
                 return r[0]
             return r
 
         def api_step(e, a):
             r = e.step(a)
-            # v0.26+: (obs, reward, terminated, truncated, info)
             if isinstance(r, tuple) and len(r) == 5:
                 obs, reward, terminated, truncated, info = r
                 done = bool(terminated) or bool(truncated)
                 return obs, reward, done, info
-            # old gym: (obs, reward, done, info)
             obs, reward, done, info = r
             return obs, reward, bool(done), info
         # -------------------------------------------------------------------
@@ -147,4 +143,3 @@ class TestExactMH_Mario(unittest.TestCase):
             self.assertGreaterEqual(accepts, 0)
         finally:
             env.close()
-

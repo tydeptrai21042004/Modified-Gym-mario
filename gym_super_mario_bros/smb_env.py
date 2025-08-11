@@ -106,6 +106,7 @@ class SuperMarioBrosEnv(NESEnv):
             friction=friction,
             x_moveforce=x_moveforce,
         )
+        self._step_count = 0
         # reset the emulator
         self.reset()
         # skip the start screen
@@ -478,12 +479,13 @@ class SuperMarioBrosEnv(NESEnv):
         self._stuck_frames = 0
         self._life_last = self._life
         self._coin_rate_ema = 0.0
+        self._step_count = 0
     def _did_reset(self):
         """Handle any RAM hacking after a reset occurs."""
         self._time_last = self._time
         self._x_position_last = self._x_position
         self._life_last = self._life
-
+        self._step_count += 1
         self._apply_custom_physics()
     def _did_step(self, done):
         """
@@ -542,6 +544,12 @@ class SuperMarioBrosEnv(NESEnv):
             + coin + status + tiny*score + anti_stuck + flag_bonus
             + living_cost + life_loss_penalty + coin_rate_bonus
         """
+        if self._step_count < 30:
+            # Strong, clean signal: reward horizontal progress; light time/death terms.
+            r = self._x_reward + 0.05 * self._time_penalty + self._death_penalty
+            return float(np.clip(r, -20, 20))
+
+        # After that, use your full shaping
         r = (
             1.0 * self._progress_reward() +
             0.1 * self._time_penalty +
@@ -555,14 +563,132 @@ class SuperMarioBrosEnv(NESEnv):
             self._coin_rate_bonus()
         )
         r += self._flag_bonus()
-
+    
         # --- ensure early rightward incentive ---
         # If progress term is zero and we're in the opening frames, provide a tiny drift
         if r == 0.0 and self._time > 0 and self._time >= (self._time_last - 2):
-            r += 0.05  # nudges value iteration to prefer moving
+            r += 0.05  
 
         return float(np.clip(r, -20, 20))
 
+
+
+    def _clip(self, v, lo, hi):
+        return lo if v < lo else hi if v > hi else v
+    def _bin(self, v, step, max_bins):
+        """Uniform binning: floor(v/step), capped to [0, max_bins-1]."""
+        b = int(v // step)
+        return b if b < max_bins else max_bins - 1
+
+    def state_features(self):
+        """
+        Return a tuple of small discrete features capturing position,
+        kinematics, and status. Adjust bins to taste.
+        """
+        ram = self.ram
+
+        # --- core positions ---
+        x = int(self._x_position)           # absolute x (page*256 + offset)
+        y = int(self._y_position)
+
+        # --- velocities (signed bytes in RAM) ---
+        # 0x0057: horizontal speed (signed), 0x009F: vertical velocity (signed)
+        vx = np.int8(ram[0x0057])
+        vy = np.int8(ram[0x009F])
+
+        # --- statuses ---
+        status = ram[0x0756]                # 0 small, 1 tall, else fireball by _STATUS_MAP default
+        pstate = ram[0x000e]                # player state enum
+        life   = ram[0x075a]
+        coins  = self._coins
+        world  = self._world
+        stage  = self._stage
+        area   = self._area
+        busy   = 1 if self._is_busy else 0
+        flag   = 1 if self._flag_get else 0
+
+        # ---------- binning plan ----------
+        # Positions: coarser x/y bins to keep state count reasonable
+        x_bin = self._bin(x, step=64,  max_bins=32)     # 32 bins of 64 px = 2048 px span
+        y_bin = self._bin(y, step=16,  max_bins=16)     # 16 bins of 16 px
+
+        # Velocity sign (+,0,-) → 3-way bins (or expand to magnitude bins)
+        def sign3(v):
+            return 0 if v < 0 else 1 if v == 0 else 2
+        vx_bin = sign3(int(vx))                         # 3 bins
+        vy_bin = sign3(int(vy))                         # 3 bins
+
+        # Status: {small,tall,fireball} → {0,1,2}
+        if status == 0:   status_bin = 0
+        elif status == 1: status_bin = 1
+        else:             status_bin = 2                # fireball/other
+
+        # Player state: bucket a few common ones; everything else→"other"
+        # 0x08 normal, 0x06 dead, 0x0B dying, others grouped
+        if   pstate == 0x08: pstate_bin = 0
+        elif pstate == 0x06: pstate_bin = 1
+        elif pstate == 0x0B: pstate_bin = 2
+        else:                pstate_bin = 3             # other/busy/etc.
+
+        # Lives clipped to small range (0..3)
+        life_bin  = int(np.clip(int(life), 0, 3))    # 4 bins
+        # Coins binned by 5s (0..95) → 20 bins
+        coins_bin = int(np.clip(coins // 5, 0, 19))  # 20 bins
+        # Time binned by 50s (0..999) → 20 bins
+        time_bin  = int(np.clip(self._time // 50, 0, 19))
+
+        # World/Stage/Area kept small (SMB: world 1..8, stage 1..4, area 1..5)
+        world_bin = int(np.clip(world - 1, 0, 7))    # 8 bins
+        stage_bin = int(np.clip(stage - 1, 0, 3))    # 4 bins
+        area_bin  = int(np.clip(area  - 1, 0, 4))    # 5 bins
+
+        busy_bin  = int(busy)                           # 2 bins
+        flag_bin  = int(flag)                           # 2 bins
+
+        # Return a compact tuple
+        return (
+            x_bin, y_bin, vx_bin, vy_bin,
+            status_bin, pstate_bin,
+            life_bin, coins_bin, time_bin,
+            world_bin, stage_bin, area_bin,
+            busy_bin, flag_bin
+        )
+
+    def state_dims(self):
+        """Cardinality of each feature in state_features() (keep in sync!)."""
+        return (
+            32,  # x_bin
+            16,  # y_bin
+            3,   # vx_bin
+            3,   # vy_bin
+            3,   # status_bin
+            4,   # pstate_bin
+            4,   # life_bin
+            20,  # coins_bin
+            20,  # time_bin
+            8,   # world_bin
+            4,   # stage_bin
+            5,   # area_bin
+            2,   # busy_bin
+            2    # flag_bin
+        )
+
+    def state_index(self):
+        """
+        Pack the discrete feature tuple into a single integer index.
+        Useful for tabular MDPs: nS = np.prod(state_dims()).
+        """
+        feats = self.state_features()
+        dims  = self.state_dims()
+        idx   = 0
+        base  = 1
+        for f, d in zip(feats, dims):
+            # safety clamp just in case
+            if f < 0: f = 0
+            if f >= d: f = d - 1
+            idx += f * base
+            base *= d
+        return int(idx)
 
 
 
@@ -585,6 +711,9 @@ class SuperMarioBrosEnv(NESEnv):
             world=self._world,
             x_pos=self._x_position,
             y_pos=self._y_position,
+            state_feat=self.state_features(),            
+            state_idx=self.state_index(),  #
+            state_dims=self.state_dims(),  
         )
 
 
